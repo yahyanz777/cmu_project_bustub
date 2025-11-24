@@ -38,9 +38,7 @@ struct FrameStatus {
       : page_id_(pid), frame_id_(fid), evictable_(ev), arc_status_(st) {}
 };
 
-/**
- * ArcReplacer implements the ARC replacement policy.
- */
+
 class ArcReplacer {
  public:
   explicit ArcReplacer(size_t num_frames);

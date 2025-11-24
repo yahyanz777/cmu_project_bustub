@@ -117,7 +117,57 @@ auto BufferPoolManager::Size() const -> size_t { return num_frames_; }
  *
  * @return The page ID of the newly allocated page.
  */
-auto BufferPoolManager::NewPage() -> page_id_t { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+
+auto BufferPoolManager::GetFreeFrame() -> std::optional<frame_id_t> {
+  std::scoped_lock lock(*bpm_latch_);
+  if (!free_frames_.empty()) {
+    frame_id_t fid = free_frames_.front();
+    free_frames_.pop_front();
+    frames_[fid]->Reset();
+    frames_[fid]->page_id.reset();
+    return fid;
+  }
+  auto victim_opt = replacer_->Evict();
+  if (!victim_opt.has_value()) {
+    return std::nullopt;
+  }
+
+  frame_id_t fid = victim_opt.value();
+  auto frame = frames_[fid];
+
+  if (!frame->page_id.has_value()) {
+    frame->Reset();
+    return fid;
+  }
+
+  page_id_t old_pid = frame->page_id.value();
+
+  if (frame->is_dirty_) {
+    DiskRequest req{};
+    req.is_write_=true;
+    req.data_=frame->GetDataMut();
+    req.page_id_=old_pid;
+    auto fut=req.callback_.get_future();
+    std::vector<DiskRequest>batch;
+    batch.push_back(std::move(req));
+    disk_scheduler_->Schedule(batch);
+    fut.get();
+  }
+  auto it = page_table_.find(old_pid);
+  if (it != page_table_.end()) {
+    page_table_.erase(it);
+  }
+  frame->Reset();
+  frame->page_id.reset();
+
+  return fid;
+}
+
+auto BufferPoolManager::NewPage() -> page_id_t { 
+
+  
+
+}
 
 /**
  * @brief Removes a page from the database, both on disk and in memory.

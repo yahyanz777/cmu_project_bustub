@@ -95,6 +95,7 @@ class FrameHeader {
    * currently storing. This might allow you to skip searching for the corresponding (page ID, frame ID) pair somewhere
    * else in the buffer pool manager...
    */
+  std::optional<page_id_t>page_id;
 };
 
 /**
@@ -125,6 +126,7 @@ class BufferPoolManager {
   void FlushAllPagesUnsafe();
   void FlushAllPages();
   auto GetPinCount(page_id_t page_id) -> std::optional<size_t>;
+  auto GetFreeFrame()->std::optional<frame_id_t>;
 
  private:
   /** @brief The number of frames in the buffer pool. */

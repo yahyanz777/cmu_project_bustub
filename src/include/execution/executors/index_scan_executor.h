@@ -34,8 +34,8 @@ class IndexScanExecutor : public AbstractExecutor {
 
   void Init() override;
 
-  auto Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<bustub::RID> *rid_batch, size_t batch_size)
-      -> bool override;
+  auto Next(std::vector<bustub::Tuple> *tuple_batch, std::vector<bustub::RID> *rid_batch,
+            size_t batch_size) -> bool override;
 
  private:
   /** The index scan plan node to be executed. */

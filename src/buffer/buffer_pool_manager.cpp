@@ -106,25 +106,18 @@ BufferPoolManager::~BufferPoolManager() = default;
 auto BufferPoolManager::Size() const -> size_t { return num_frames_; }
 
 /**
- * @brief Allocates a new page on disk.
+ * @brief Fetch a free frame from the buffer pool.
  *
- * ### Implementation
- *
- * You will maintain a thread-safe, monotonically increasing counter in the form of a `std::atomic<page_id_t>`.
- * See the documentation on [atomics](https://en.cppreference.com/w/cpp/atomic/atomic) for more information.
- *
- * TODO(P1): Add implementation.
- *
- * @return The page ID of the newly allocated page.
+ * @return std::optional<frame_id_t> The ID of the free frame, or nullopt if none exist.
  */
 
 auto BufferPoolManager::GetFreeFrame() -> std::optional<frame_id_t> {
-  std::scoped_lock lock(*bpm_latch_);
   if (!free_frames_.empty()) {
     frame_id_t fid = free_frames_.front();
     free_frames_.pop_front();
     frames_[fid]->Reset();
-    frames_[fid]->page_id.reset();
+    frames_[fid]->page_id_.reset();
+
     return fid;
   }
   auto victim_opt = replacer_->Evict();
@@ -135,20 +128,20 @@ auto BufferPoolManager::GetFreeFrame() -> std::optional<frame_id_t> {
   frame_id_t fid = victim_opt.value();
   auto frame = frames_[fid];
 
-  if (!frame->page_id.has_value()) {
+  if (!frame->page_id_.has_value()) {
     frame->Reset();
     return fid;
   }
 
-  page_id_t old_pid = frame->page_id.value();
+  page_id_t old_pid = frame->page_id_.value();
 
   if (frame->is_dirty_) {
     DiskRequest req{};
-    req.is_write_=true;
-    req.data_=frame->GetDataMut();
-    req.page_id_=old_pid;
-    auto fut=req.callback_.get_future();
-    std::vector<DiskRequest>batch;
+    req.is_write_ = true;
+    req.data_ = frame->GetDataMut();
+    req.page_id_ = old_pid;
+    auto fut = req.callback_.get_future();
+    std::vector<DiskRequest> batch;
     batch.push_back(std::move(req));
     disk_scheduler_->Schedule(batch);
     fut.get();
@@ -158,15 +151,46 @@ auto BufferPoolManager::GetFreeFrame() -> std::optional<frame_id_t> {
     page_table_.erase(it);
   }
   frame->Reset();
-  frame->page_id.reset();
-
+  frame->page_id_.reset();
   return fid;
 }
 
-auto BufferPoolManager::NewPage() -> page_id_t { 
+auto BufferPoolManager::NewPage() -> page_id_t {
+  std::lock_guard<std::mutex> lock(*bpm_latch_);
 
-  
+  auto frame_id = GetFreeFrame();
+  if (!frame_id.has_value()) {
+    return INVALID_PAGE_ID;
+  }
+  frame_id_t fid = frame_id.value();
 
+  page_id_t new_page_id = next_page_id_.fetch_add(1);
+  std::shared_ptr<FrameHeader> page = frames_[fid];
+
+  page->page_id_ = new_page_id;
+  page->pin_count_ = 1;
+  page->is_dirty_ = false;
+  // Reset BEFORE writing to disk so we write zeros
+  page->Reset();
+
+  page_table_[new_page_id] = fid;
+  replacer_->RecordAccess(fid, new_page_id);
+  replacer_->SetEvictable(fid, false);
+
+  // Write the empty page to disk
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  DiskRequest req{};
+  req.is_write_ = true;
+  req.data_ = page->GetDataMut();
+  req.page_id_ = new_page_id;
+  req.callback_ = std::move(promise);
+  std::vector<DiskRequest> batch;
+  batch.push_back(std::move(req));
+  disk_scheduler_->Schedule(batch);
+  future.get();
+
+  return new_page_id;
 }
 
 /**
@@ -188,7 +212,24 @@ auto BufferPoolManager::NewPage() -> page_id_t {
  * @param page_id The page ID of the page we want to delete.
  * @return `false` if the page exists but could not be deleted, `true` if the page didn't exist or deletion succeeded.
  */
-auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
+  std::lock_guard<std::mutex> lock(*bpm_latch_);
+  auto it = page_table_.find(page_id);
+  if (it != page_table_.end()) {
+    frame_id_t frame_id = it->second;
+    auto frame = frames_[frame_id];
+    if (frame->pin_count_.load() > 0) {
+      return false;
+    }
+    page_table_.erase(it);
+    frame->Reset();
+    frame->page_id_.reset();
+    free_frames_.push_back(frame_id);
+    replacer_->Remove(frame_id);
+  }
+  disk_scheduler_->DeallocatePage(page_id);
+  return true;
+}
 
 /**
  * @brief Acquires an optional write-locked guard over a page of data. The user can specify an `AccessType` if needed.
@@ -229,9 +270,6 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool { UNIMPLEMENTED("T
  * @return std::optional<WritePageGuard> An optional latch guard where if there are no more free frames (out of memory)
  * returns `std::nullopt`; otherwise, returns a `WritePageGuard` ensuring exclusive and mutable access to a page's data.
  */
-auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_type) -> std::optional<WritePageGuard> {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
-}
 
 /**
  * @brief Acquires an optional read-locked guard over a page of data. The user can specify an `AccessType` if needed.
@@ -257,8 +295,132 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
  * @return std::optional<ReadPageGuard> An optional latch guard where if there are no more free frames (out of memory)
  * returns `std::nullopt`; otherwise, returns a `ReadPageGuard` ensuring shared and read-only access to a page's data.
  */
+auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_type) -> std::optional<WritePageGuard> {
+  std::unique_lock<std::mutex> lock(*bpm_latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it != page_table_.end()) {
+    frame_id_t frame_id = it->second;
+    auto frame = frames_[frame_id];
+
+    // Increment pin count
+    frame->pin_count_.fetch_add(1);
+
+    // Record access and mark as not evictable
+    replacer_->RecordAccess(frame_id, page_id, access_type);
+    replacer_->SetEvictable(frame_id, false);
+
+    // UNLOCK BPM LATCH BEFORE CREATING GUARD
+    lock.unlock();
+
+    return WritePageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+  }
+
+  auto free_frame_opt = GetFreeFrame();
+  if (!free_frame_opt.has_value()) {
+    return std::nullopt;
+  }
+
+  frame_id_t frame_id = free_frame_opt.value();
+  auto frame = frames_[frame_id];
+
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  DiskRequest req{};
+  req.is_write_ = false;
+  req.data_ = frame->GetDataMut();
+  req.page_id_ = page_id;
+  req.callback_ = std::move(promise);
+  std::vector<DiskRequest> batch;
+  batch.push_back(std::move(req));
+  disk_scheduler_->Schedule(batch);
+
+  bool success = future.get();
+  if (!success) {
+    free_frames_.push_back(frame_id);
+    return std::nullopt;
+  }
+
+  frame->page_id_ = page_id;
+  frame->pin_count_.store(1);
+  frame->is_dirty_ = false;
+
+  page_table_[page_id] = frame_id;
+
+  replacer_->RecordAccess(frame_id, page_id, access_type);
+  replacer_->SetEvictable(frame_id, false);
+
+  // UNLOCK BPM LATCH BEFORE CREATING GUARD
+  lock.unlock();
+
+  return WritePageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+}
+
 auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_type) -> std::optional<ReadPageGuard> {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+  std::unique_lock<std::mutex> lock(*bpm_latch_);
+
+  // Check if the page is already in memory
+  auto it = page_table_.find(page_id);
+  if (it != page_table_.end()) {
+    frame_id_t frame_id = it->second;
+    auto frame = frames_[frame_id];
+
+    // Increment pin count
+    frame->pin_count_.fetch_add(1);
+
+    // Record access and mark as not evictable
+    replacer_->RecordAccess(frame_id, page_id, access_type);
+    replacer_->SetEvictable(frame_id, false);
+
+    // UNLOCK BPM LATCH BEFORE CREATING GUARD
+    lock.unlock();
+
+    return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
+  }
+
+  // Get a free frame
+  auto free_frame_opt = GetFreeFrame();
+  if (!free_frame_opt.has_value()) {
+    return std::nullopt;
+  }
+
+  frame_id_t frame_id = free_frame_opt.value();
+  auto frame = frames_[frame_id];
+
+  // Read the page from disk
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  DiskRequest req{};
+  req.is_write_ = false;
+  req.data_ = frame->GetDataMut();
+  req.page_id_ = page_id;
+  req.callback_ = std::move(promise);
+  std::vector<DiskRequest> batch;
+  batch.push_back(std::move(req));
+  disk_scheduler_->Schedule(batch);
+
+  bool success = future.get();
+  if (!success) {
+    free_frames_.push_back(frame_id);
+    return std::nullopt;
+  }
+
+  // Update frame metadata
+  frame->page_id_ = page_id;
+  frame->pin_count_.store(1);
+  frame->is_dirty_ = false;
+
+  // Update page table
+  page_table_[page_id] = frame_id;
+
+  // Record access and mark as not evictable
+  replacer_->RecordAccess(frame_id, page_id, access_type);
+  replacer_->SetEvictable(frame_id, false);
+
+  // UNLOCK BPM LATCH BEFORE CREATING GUARD
+  lock.unlock();
+
+  return ReadPageGuard(page_id, frame, replacer_, bpm_latch_, disk_scheduler_);
 }
 
 /**
@@ -330,7 +492,41 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
  * @param page_id The page ID of the page to be flushed.
  * @return `false` if the page could not be found in the page table; otherwise, `true`.
  */
-auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool {
+  std::scoped_lock bpm_lock(*bpm_latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
+    return false;
+  }
+
+  frame_id_t fid = it->second;
+  auto frame = frames_[fid];
+
+  if (!frame->is_dirty_) {
+    return true;
+  }
+
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+
+  DiskRequest req{};
+  req.is_write_ = true;
+  req.data_ = frame->GetDataMut();
+  req.page_id_ = page_id;
+  req.callback_ = std::move(promise);
+
+  std::vector<DiskRequest> batch;
+  batch.push_back(std::move(req));
+  disk_scheduler_->Schedule(batch);
+
+  bool ok = future.get();
+  if (ok) {
+    frame->is_dirty_ = false;
+  }
+
+  return ok;
+}
 
 /**
  * @brief Flushes a page's data out to disk safely.
@@ -350,7 +546,43 @@ auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool { UNIMPLEMENT
  * @param page_id The page ID of the page to be flushed.
  * @return `false` if the page could not be found in the page table; otherwise, `true`.
  */
-auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
+  std::scoped_lock bpm_lock(*bpm_latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
+    return false;
+  }
+
+  frame_id_t fid = it->second;
+  auto frame = frames_[fid];
+
+  // SAFE: take frame write latch
+  std::unique_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
+
+  if (!frame->is_dirty_) {
+    return true;
+  }
+
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+
+  DiskRequest req{};
+  req.is_write_ = true;
+  req.data_ = frame->GetDataMut();
+  req.page_id_ = page_id;
+  req.callback_ = std::move(promise);
+
+  std::vector<DiskRequest> batch;
+  batch.push_back(std::move(req));
+  disk_scheduler_->Schedule(batch);
+
+  bool ok = future.get();
+  if (ok) {
+    frame->is_dirty_ = false;
+  }
+  return ok;
+}
 
 /**
  * @brief Flushes all page data that is in memory to disk unsafely.
@@ -365,7 +597,35 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool { UNIMPLEMENTED("TO
  *
  * TODO(P1): Add implementation
  */
-void BufferPoolManager::FlushAllPagesUnsafe() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void BufferPoolManager::FlushAllPagesUnsafe() {
+  // Take BPM latch but no frame latches
+  std::scoped_lock bpm_lock(*bpm_latch_);
+
+  for (const auto &[page_id, frame_id] : page_table_) {
+    auto frame = frames_[frame_id];
+
+    if (!frame->is_dirty_) {
+      continue;
+    }
+
+    auto promise = disk_scheduler_->CreatePromise();
+    auto future = promise.get_future();
+
+    DiskRequest req{};
+    req.is_write_ = true;
+    req.data_ = frame->GetDataMut();
+    req.page_id_ = page_id;
+    req.callback_ = std::move(promise);
+
+    std::vector<DiskRequest> batch;
+    batch.push_back(std::move(req));
+    disk_scheduler_->Schedule(batch);
+    bool ok = future.get();
+    if (ok) {
+      frame->is_dirty_ = false;
+    }
+  }
+}
 
 /**
  * @brief Flushes all page data that is in memory to disk safely.
@@ -379,7 +639,37 @@ void BufferPoolManager::FlushAllPagesUnsafe() { UNIMPLEMENTED("TODO(P1): Add imp
  *
  * TODO(P1): Add implementation
  */
-void BufferPoolManager::FlushAllPages() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void BufferPoolManager::FlushAllPages() {
+  // Take BPM latch to safely access page_table_
+  std::scoped_lock bpm_lock(*bpm_latch_);
+
+  // Iterate through all pages in the page table
+  for (const auto &[page_id, frame_id] : page_table_) {
+    auto frame = frames_[frame_id];
+
+    // Take the frame's WRITE latch to ensure consistent flush
+    // This prevents concurrent modifications during flush
+    std::unique_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
+
+    // Only flush if dirty
+    if (frame->is_dirty_) {
+      auto promise = disk_scheduler_->CreatePromise();
+      auto future = promise.get_future();
+      DiskRequest req{};
+      req.is_write_ = true;
+      req.data_ = frame->GetDataMut();
+      req.page_id_ = page_id;
+      req.callback_ = std::move(promise);
+      std::vector<DiskRequest> batch;
+      batch.push_back(std::move(req));
+      disk_scheduler_->Schedule(batch);
+      future.get();
+
+      // Mark as clean after successful flush
+      frame->is_dirty_ = false;
+    }
+  }
+}
 
 /**
  * @brief Retrieves the pin count of a page. If the page does not exist in memory, return `std::nullopt`.
@@ -406,7 +696,14 @@ void BufferPoolManager::FlushAllPages() { UNIMPLEMENTED("TODO(P1): Add implement
  * @return std::optional<size_t> The pin count if the page exists; otherwise, `std::nullopt`.
  */
 auto BufferPoolManager::GetPinCount(page_id_t page_id) -> std::optional<size_t> {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+  std::scoped_lock lock(*bpm_latch_);
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
+    return std::nullopt;
+  }
+  frame_id_t frame_id = it->second;
+  auto frame = frames_[frame_id];
+  return frame->pin_count_.load();
 }
 
 }  // namespace bustub

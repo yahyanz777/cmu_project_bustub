@@ -95,7 +95,7 @@ class FrameHeader {
    * currently storing. This might allow you to skip searching for the corresponding (page ID, frame ID) pair somewhere
    * else in the buffer pool manager...
    */
-  std::optional<page_id_t>page_id;
+  std::optional<page_id_t> page_id_;
 };
 
 /**
@@ -113,11 +113,12 @@ class BufferPoolManager {
   BufferPoolManager(size_t num_frames, DiskManager *disk_manager, LogManager *log_manager = nullptr);
   ~BufferPoolManager();
 
+  auto GetFreeFrame() -> std::optional<frame_id_t>;
   auto Size() const -> size_t;
   auto NewPage() -> page_id_t;
   auto DeletePage(page_id_t page_id) -> bool;
-  auto CheckedWritePage(page_id_t page_id, AccessType access_type = AccessType::Unknown)
-      -> std::optional<WritePageGuard>;
+  auto CheckedWritePage(page_id_t page_id,
+                        AccessType access_type = AccessType::Unknown) -> std::optional<WritePageGuard>;
   auto CheckedReadPage(page_id_t page_id, AccessType access_type = AccessType::Unknown) -> std::optional<ReadPageGuard>;
   auto WritePage(page_id_t page_id, AccessType access_type = AccessType::Unknown) -> WritePageGuard;
   auto ReadPage(page_id_t page_id, AccessType access_type = AccessType::Unknown) -> ReadPageGuard;
@@ -126,7 +127,6 @@ class BufferPoolManager {
   void FlushAllPagesUnsafe();
   void FlushAllPages();
   auto GetPinCount(page_id_t page_id) -> std::optional<size_t>;
-  auto GetFreeFrame()->std::optional<frame_id_t>;
 
  private:
   /** @brief The number of frames in the buffer pool. */

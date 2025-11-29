@@ -18,7 +18,6 @@
 namespace bustub {
 
 DiskScheduler::DiskScheduler(DiskManager *disk_manager) : disk_manager_(disk_manager) {
- 
   // Spawn the background thread
   background_thread_.emplace([&] { StartWorkerThread(); });
 }
@@ -39,7 +38,7 @@ DiskScheduler::~DiskScheduler() {
  * @param requests The requests to be scheduled.
  */
 void DiskScheduler::Schedule(std::vector<DiskRequest> &requests) {
-  for(auto& req : requests){
+  for (auto &req : requests) {
     request_queue_.Put(std::move(req));
   }
 }
@@ -53,18 +52,17 @@ void DiskScheduler::Schedule(std::vector<DiskRequest> &requests) {
  * return until ~DiskScheduler() is called. At that point you need to make sure that the function does return.
  */
 void DiskScheduler::StartWorkerThread() {
-
-  while(true){
-    std::optional<DiskRequest> request=request_queue_.Get();
-    if(!request.has_value())
-    break;
-    if(request->is_write_){
-      disk_manager_->WritePage(request->page_id_,request->data_);
-    }else{
-      disk_manager_->ReadPage(request->page_id_,request->data_);
+  while (true) {
+    std::optional<DiskRequest> request = request_queue_.Get();
+    if (!request.has_value()) {
+      break;
+    }
+    if (request->is_write_) {
+      disk_manager_->WritePage(request->page_id_, request->data_);
+    } else {
+      disk_manager_->ReadPage(request->page_id_, request->data_);
     }
     request->callback_.set_value(true);
   }
-
 }
 }  // namespace bustub

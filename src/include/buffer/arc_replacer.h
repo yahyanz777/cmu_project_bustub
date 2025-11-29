@@ -34,10 +34,11 @@ struct FrameStatus {
   frame_id_t frame_id_;
   bool evictable_;
   ArcStatus arc_status_;
+  std::list<frame_id_t>::iterator iter_;
+  std::list<page_id_t>::iterator ghost_iter_;
   FrameStatus(page_id_t pid, frame_id_t fid, bool ev, ArcStatus st)
       : page_id_(pid), frame_id_(fid), evictable_(ev), arc_status_(st) {}
 };
-
 
 class ArcReplacer {
  public:

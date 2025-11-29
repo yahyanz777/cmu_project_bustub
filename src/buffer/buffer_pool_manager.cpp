@@ -168,7 +168,7 @@ auto BufferPoolManager::NewPage() -> page_id_t {
   std::shared_ptr<FrameHeader> page = frames_[fid];
 
   page->page_id_ = new_page_id;
-  page->pin_count_ = 1;
+  page->pin_count_ = 0;
   page->is_dirty_ = false;
   // Reset BEFORE writing to disk so we write zeros
   page->Reset();
@@ -558,7 +558,7 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
   auto frame = frames_[fid];
 
   // SAFE: take frame write latch
-  std::unique_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
+  std::shared_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
 
   if (!frame->is_dirty_) {
     return true;
@@ -647,9 +647,8 @@ void BufferPoolManager::FlushAllPages() {
   for (const auto &[page_id, frame_id] : page_table_) {
     auto frame = frames_[frame_id];
 
-    // Take the frame's WRITE latch to ensure consistent flush
-    // This prevents concurrent modifications during flush
-    std::unique_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
+    // CHANGED: Use shared_lock to allow concurrent reads while flushing
+    std::shared_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
 
     // Only flush if dirty
     if (frame->is_dirty_) {

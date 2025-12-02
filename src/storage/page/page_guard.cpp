@@ -87,7 +87,7 @@ void ReadPageGuard::Flush() {
   if (!is_valid_) {
     return;
   }
-
+  
   // Check if the page is dirty (shouldn't be for read guard, but could be from previous write)
   if (!frame_->is_dirty_) {
     return;  // Nothing to flush

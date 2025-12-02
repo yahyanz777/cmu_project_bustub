@@ -29,7 +29,7 @@ The following instructions are adapted from the GitHub documentation on [duplica
    ```console
    $ cd bustub-public
    
-   # If you pull / push over HTTPS
+   # If you pull / push over HTTPSرف
    $ git push https://github.com/student/bustub-private.git master
 
    # If you pull / push over SSH

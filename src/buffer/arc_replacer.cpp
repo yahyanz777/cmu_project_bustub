@@ -12,8 +12,6 @@
 
 #include "buffer/arc_replacer.h"
 
-#include <optional>
-
 #include "common/config.h"
 
 namespace bustub {
@@ -52,29 +50,12 @@ auto ArcReplacer::Evict() -> std::optional<frame_id_t> {
       alive_list.erase(std::next(it).base());
       alive_map_.erase(mit);
 
-      if (curr_size_ > 0) {
-        --curr_size_;
-      }
-
+      --curr_size_;
       // Add to ghost list at front (most recent)
       ghost_list.push_front(p_id);
       auto ghost_status_ptr = std::make_shared<FrameStatus>(p_id, static_cast<frame_id_t>(-1), false, ghost_status);
       ghost_status_ptr->ghost_iter_ = ghost_list.begin();
       ghost_map_[p_id] = ghost_status_ptr;
-
-      // Trim ghost lists if needed
-      size_t all_ghost_size = mru_ghost_.size() + mfu_ghost_.size();
-      if (all_ghost_size > replacer_size_) {
-        if (mru_ghost_.size() >= mfu_ghost_.size()) {
-          page_id_t pid_trim = mru_ghost_.back();
-          mru_ghost_.pop_back();
-          ghost_map_.erase(pid_trim);
-        } else {
-          page_id_t pid_trim = mfu_ghost_.back();
-          mfu_ghost_.pop_back();
-          ghost_map_.erase(pid_trim);
-        }
-      }
 
       return f_id;
     }
@@ -83,18 +64,25 @@ auto ArcReplacer::Evict() -> std::optional<frame_id_t> {
   };
 
   bool prefer_mru = (mru_.size() >= mru_target_size_);
+  std::cout << "eviction: " << (prefer_mru ? "MRU" : "MFU") << " mru_size=" << mru_.size()
+            << " target=" << mru_target_size_ << std::endl;
+
   if (prefer_mru) {
     if (auto res = try_evict(mru_, mru_ghost_, ArcStatus::MRU_GHOST)) {
+      std::cout << "Evicted from MRU: " << *res << std::endl;
       return res;
     }
     if (auto res = try_evict(mfu_, mfu_ghost_, ArcStatus::MFU_GHOST)) {
+      std::cout << "Evicted from MFU (fallback): " << *res << std::endl;
       return res;
     }
   } else {
     if (auto res = try_evict(mfu_, mfu_ghost_, ArcStatus::MFU_GHOST)) {
+      std::cout << "Evicted from MFU: " << *res << std::endl;
       return res;
     }
     if (auto res = try_evict(mru_, mru_ghost_, ArcStatus::MRU_GHOST)) {
+      std::cout << "Evicted from MRU (fallback): " << *res << std::endl;
       return res;
     }
   }
@@ -120,7 +108,6 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
 
     // Promote to MFU and update page id.
     fs->arc_status_ = ArcStatus::MFU;
-    fs->page_id_ = page_id;
 
     // Insert at front of MFU and store iterator.
     mfu_.push_front(frame_id);
@@ -128,85 +115,63 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
     return;
   }
 
-  // Case 2/3: Ghost hit.
-  auto it_ghost = ghost_map_.find(page_id);
-  if (it_ghost != ghost_map_.end()) {
-    auto gfs = it_ghost->second;
+  // Case 2: Hit in ghost lists
+  auto ghost_it = ghost_map_.find(page_id);
+  if (ghost_it != ghost_map_.end()) {
+    auto gfs = ghost_it->second;
+    bool was_b1 = (gfs->arc_status_ == ArcStatus::MRU_GHOST);
 
-    // Calculate sizes BEFORE modifying the lists
-    size_t mru_ghost_size = mru_ghost_.size();
-    size_t mfu_ghost_size = mfu_ghost_.size();
-    bool was_mru_ghost = (gfs->arc_status_ == ArcStatus::MRU_GHOST);
+    size_t b1 = mru_ghost_.size();
+    size_t b2 = mfu_ghost_.size();
 
-    // Adjust target size p according to the algorithm
-    if (was_mru_ghost) {
-      // Case 2: MRU ghost hit
-      if (mru_ghost_size >= mfu_ghost_size) {
-        // Increase by 1
-        mru_target_size_ = std::min(mru_target_size_ + 1, replacer_size_);
-      } else if (mru_ghost_size > 0) {
-        // Increase by mfu_ghost_size / mru_ghost_size (rounded down)
-        size_t delta = mfu_ghost_size / mru_ghost_size;
-        mru_target_size_ = std::min(mru_target_size_ + delta, replacer_size_);
-      }
+    // Adaptation
+    if (was_b1) {
+      size_t delta = (b1 >= b2 ? 1 : b2 / b1);
+      mru_target_size_ = std::min(mru_target_size_ + delta, replacer_size_);
     } else {
-      // Case 3: MFU ghost hit
-      if (mfu_ghost_size >= mru_ghost_size) {
-        // Decrease by 1
-        if (mru_target_size_ > 0) {
-          mru_target_size_--;
-        }
-      } else if (mfu_ghost_size > 0) {
-        // Decrease by mru_ghost_size / mfu_ghost_size (rounded down)
-        size_t delta = mru_ghost_size / mfu_ghost_size;
-        if (mru_target_size_ >= delta) {
-          mru_target_size_ -= delta;
-        } else {
-          mru_target_size_ = 0;
-        }
-      }
+      size_t delta = (b2 >= b1 ? 1 : b1 / b2);
+      mru_target_size_ = (mru_target_size_ > delta) ? (mru_target_size_ - delta) : 0;
     }
 
-    // Remove from ghost lists and ghost_map_.
-    if (gfs->arc_status_ == ArcStatus::MRU_GHOST) {
+    // Remove from ghost
+    if (was_b1) {
       mru_ghost_.erase(gfs->ghost_iter_);
     } else {
-      BUSTUB_ASSERT(gfs->arc_status_ == ArcStatus::MFU_GHOST, "Ghost frame must be MRU_GHOST or MFU_GHOST");
       mfu_ghost_.erase(gfs->ghost_iter_);
     }
-    ghost_map_.erase(it_ghost);
+    ghost_map_.erase(ghost_it);
 
-    // Add to MFU alive.
+    // Insert into MFU (T2)
     auto fs = std::make_shared<FrameStatus>(page_id, frame_id, false, ArcStatus::MFU);
     mfu_.push_front(frame_id);
     fs->iter_ = mfu_.begin();
     alive_map_[frame_id] = fs;
-    // Note: evictable_ stays false until SetEvictable is called.
     return;
   }
 
-  // Case 4: Miss in all lists.
-  size_t alive_total = alive_map_.size();
-  size_t ghost_total = ghost_map_.size();
+  size_t t1 = mru_.size();
+  size_t b1 = mru_ghost_.size();
 
-  // Case 4(a): |T1| + |B1| == c
-  if (mru_.size() + mru_ghost_.size() == replacer_size_) {
+  // Case 4(a)
+  if (t1 + b1 == replacer_size_) {
     if (!mru_ghost_.empty()) {
       page_id_t old = mru_ghost_.back();
       mru_ghost_.pop_back();
       ghost_map_.erase(old);
     }
   }
-  // Case 4(b): |T1| + |T2| + |B1| + |B2| == 2c
-  else if (alive_total + ghost_total == 2 * replacer_size_) {
-    if (!mfu_ghost_.empty()) {
-      page_id_t old = mfu_ghost_.back();
-      mfu_ghost_.pop_back();
-      ghost_map_.erase(old);
+  // Case 4(b)
+  else if (mru_.size() + mru_ghost_.size() < replacer_size_) {
+    if (mru_.size() + mru_ghost_.size() + mfu_.size() + mfu_ghost_.size() == replacer_size_ * 2) {
+      if (!mfu_ghost_.empty()) {
+        page_id_t old = mfu_ghost_.back();
+        mfu_ghost_.pop_back();
+        ghost_map_.erase(old);
+      }
     }
   }
 
-  // Insert into MRU alive.
+  // Insert into MRU (T1)
   auto fs = std::make_shared<FrameStatus>(page_id, frame_id, false, ArcStatus::MRU);
   mru_.push_front(frame_id);
   fs->iter_ = mru_.begin();
@@ -220,17 +185,13 @@ void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
     throw std::runtime_error("SetEvictable() called on invalid frame_id");
   }
 
-  auto fs = it->second;
-  bool curr_evictable = fs->evictable_;
-  if (curr_evictable != set_evictable) {
-    fs->evictable_ = set_evictable;
-    if (set_evictable) {
-      ++curr_size_;
-    } else {
-      if (curr_size_ > 0) {
-        --curr_size_;
-      }
-    }
+  auto status = alive_map_[frame_id];
+  if (status->evictable_ && !set_evictable) {
+    curr_size_--;
+    status->evictable_ = false;
+  } else if (!status->evictable_ && set_evictable) {
+    curr_size_++;
+    status->evictable_ = true;
   }
 }
 

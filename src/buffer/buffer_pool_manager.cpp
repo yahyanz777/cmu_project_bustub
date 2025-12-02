@@ -1,3 +1,4 @@
+
 //===----------------------------------------------------------------------===//
 //
 //                         BusTub
@@ -150,6 +151,7 @@ auto BufferPoolManager::GetFreeFrame() -> std::optional<frame_id_t> {
   if (it != page_table_.end()) {
     page_table_.erase(it);
   }
+  replacer_->Remove(fid);
   frame->Reset();
   frame->page_id_.reset();
   return fid;
@@ -168,14 +170,14 @@ auto BufferPoolManager::NewPage() -> page_id_t {
   std::shared_ptr<FrameHeader> page = frames_[fid];
 
   page->page_id_ = new_page_id;
-  page->pin_count_ = 0;
+  page->pin_count_.store(1);
   page->is_dirty_ = false;
   // Reset BEFORE writing to disk so we write zeros
   page->Reset();
 
   page_table_[new_page_id] = fid;
   replacer_->RecordAccess(fid, new_page_id);
-  replacer_->SetEvictable(fid, true);
+  replacer_->SetEvictable(fid, false);
   // Write the empty page to disk
   auto promise = disk_scheduler_->CreatePromise();
   auto future = promise.get_future();
@@ -492,171 +494,71 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
  * @return `false` if the page could not be found in the page table; otherwise, `true`.
  */
 auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool {
-  auto it = page_table_.find(page_id);
-  if (it == page_table_.end()) {
+  if (page_table_.find(page_id) == page_table_.end()) {
     return false;
   }
-  frame_id_t frame_id = it->second;
+  frame_id_t frame_id = page_table_[page_id];
   auto frame = frames_[frame_id];
-  if (!frame->is_dirty_) {
-    return true;
+  if (frame->is_dirty_) {
+    DiskRequest request{true, frame->GetDataMut(), page_id, {}};
+    auto future = request.callback_.get_future();
+    std::vector<DiskRequest> batch;
+    batch.push_back(std::move(request));
+    disk_scheduler_->Schedule(batch);
+    future.get();
+    frame->is_dirty_ = false;
   }
-  auto promise = disk_scheduler_->CreatePromise();
-  auto future = promise.get_future();
-  DiskRequest req{};
-  req.is_write_ = true;
-  req.data_ = frame->GetDataMut();
-  req.page_id_ = page_id;
-  req.callback_ = std::move(promise);
-  std::vector<DiskRequest> batch;
-  batch.push_back(std::move(req));
-  disk_scheduler_->Schedule(batch);
-  future.get();
-  frame->is_dirty_ = false;
   return true;
 }
 
-/**
- * @brief Flushes a page's data out to disk safely.
- *
- * This function will write out a page's data to disk if it has been modified. If the given page is not in memory, this
- * function will return `false`.
- *
- * You should take a lock on the page in this function to ensure that a consistent state is flushed to disk.
- *
- * ### Implementation
- *
- * You should probably leave implementing this function until after you have completed `CheckedReadPage`,
- * `CheckedWritePage`, and `Flush` in the page guards, as it will likely be much easier to understand what to do.
- *
- * TODO(P1): Add implementation
- *
- * @param page_id The page ID of the page to be flushed.
- * @return `false` if the page could not be found in the page table; otherwise, `true`.
- */
 auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
-  // Take BPM latch to safely access page_table_
-  std::scoped_lock bpm_lock(*bpm_latch_);
-
-  auto it = page_table_.find(page_id);
-  if (it == page_table_.end()) {
-    return false;  // Page not in buffer pool
+  std::shared_ptr<FrameHeader> frame;
+  {
+    std::lock_guard<std::mutex> lock(*bpm_latch_);
+    if (page_table_.find(page_id) == page_table_.end()) {
+      return false;
+    }
+    frame_id_t frame_id = page_table_[page_id];
+    frame = frames_[frame_id];
   }
 
-  frame_id_t frame_id = it->second;
-  auto frame = frames_[frame_id];
+  // Acquire frame latch
+  std::lock_guard<std::shared_mutex> frame_lock(frame->rwlatch_);
 
-  // Take the frame's WRITE latch to ensure consistent flush
-  // This prevents concurrent modifications during flush
-  std::shared_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
-
-  // Only flush if dirty
-  if (!frame->is_dirty_) {
-    return true;  // Already clean, nothing to do
+  // Double check that the frame still holds the correct page
+  if (!frame->page_id_.has_value() || frame->page_id_.value() != page_id) {
+    return false;
   }
 
-  // Write to disk
-  auto promise = disk_scheduler_->CreatePromise();
-  auto future = promise.get_future();
-  DiskRequest req{};
-  req.is_write_ = true;
-  req.data_ = frame->GetDataMut();
-  req.page_id_ = page_id;
-  req.callback_ = std::move(promise);
-  std::vector<DiskRequest> batch;
-  batch.push_back(std::move(req));
-  disk_scheduler_->Schedule(batch);
-  future.get();
-
-  // Mark as clean after successful flush
-  frame->is_dirty_ = false;
-
+  if (frame->is_dirty_) {
+    DiskRequest request{true, frame->GetDataMut(), page_id, {}};
+    auto future = request.callback_.get_future();
+    std::vector<DiskRequest> batch;
+    batch.push_back(std::move(request));
+    disk_scheduler_->Schedule(batch);
+    future.get();
+    frame->is_dirty_ = false;
+  }
   return true;
 }
 
-/**
- * @brief Flushes all page data that is in memory to disk unsafely.
- *
- * You should not take locks on the pages in this function.
- * This means that you should carefully consider when to toggle the `is_dirty_` bit.
- *
- * ### Implementation
- *
- * You should probably leave implementing this function until after you have completed `CheckedReadPage`,
- * `CheckedWritePage`, and `FlushPage`, as it will likely be much easier to understand what to do.
- *
- * TODO(P1): Add implementation
- */
 void BufferPoolManager::FlushAllPagesUnsafe() {
-  // NOTE: Does NOT take BPM latch or frame latches
-  // Assumes caller has ensured thread safety
-
-  // Iterate through all pages in the page table
-  // WARNING: This is inherently racy since page_table_ could be modified
-  // But that's what "unsafe" means - caller's responsibility
-  for (const auto &[page_id, frame_id] : page_table_) {
-    auto frame = frames_[frame_id];
-
-    // No frame latch taken - this is "unsafe"
-    // Only flush if dirty
-    if (frame->is_dirty_) {
-      auto promise = disk_scheduler_->CreatePromise();
-      auto future = promise.get_future();
-      DiskRequest req{};
-      req.is_write_ = true;
-      req.data_ = frame->GetDataMut();
-      req.page_id_ = page_id;
-      req.callback_ = std::move(promise);
-      std::vector<DiskRequest> batch;
-      batch.push_back(std::move(req));
-      disk_scheduler_->Schedule(batch);
-      future.get();
-
-      // CAREFULLY toggle is_dirty_ after successful flush
-      frame->is_dirty_ = false;
-    }
+  for (auto const &[pid, fid] : page_table_) {
+    FlushPageUnsafe(pid);
   }
 }
 
-/**
- * @brief Flushes all page data that is in memory to disk safely.
- *
- * You should take locks on the pages in this function to ensure that a consistent state is flushed to disk.
- *
- * ### Implementation
- *
- * You should probably leave implementing this function until after you have completed `CheckedReadPage`,
- * `CheckedWritePage`, and `FlushPage`, as it will likely be much easier to understand what to do.
- *
- * TODO(P1): Add implementation
- */
 void BufferPoolManager::FlushAllPages() {
-  // Take BPM latch to safely access page_table_
-  std::scoped_lock bpm_lock(*bpm_latch_);
-
-  // Iterate through all pages in the page table
-  for (const auto &[page_id, frame_id] : page_table_) {
-    auto frame = frames_[frame_id];
-
-    // Take the frame's WRITE latch to ensure consistent flush
-    // This prevents concurrent modifications during flush
-    std::shared_lock<std::shared_mutex> frame_lock(frame->rwlatch_);
-
-    // Only flush if dirty
-    if (frame->is_dirty_) {
-      auto promise = disk_scheduler_->CreatePromise();
-      auto future = promise.get_future();
-      DiskRequest req{};
-      req.is_write_ = true;
-      req.data_ = frame->GetDataMut();
-      req.page_id_ = page_id;
-      req.callback_ = std::move(promise);
+  // Iterate over all frames without holding bpm_latch_
+  for (const auto &frame : frames_) {
+    std::lock_guard<std::shared_mutex> frame_lock(frame->rwlatch_);
+    if (frame->page_id_.has_value() && frame->is_dirty_) {
+      DiskRequest request{true, frame->GetDataMut(), frame->page_id_.value(), {}};
+      auto future = request.callback_.get_future();
       std::vector<DiskRequest> batch;
-      batch.push_back(std::move(req));
+      batch.push_back(std::move(request));
       disk_scheduler_->Schedule(batch);
       future.get();
-
-      // Mark as clean after successful flush
       frame->is_dirty_ = false;
     }
   }

@@ -1,3 +1,4 @@
+
 //===----------------------------------------------------------------------===//
 //
 //                         BusTub
@@ -128,7 +129,7 @@ class BufferPoolManager {
   void FlushAllPages();
   auto GetPinCount(page_id_t page_id) -> std::optional<size_t>;
 
-  private:
+ private:
   /** @brief The number of frames in the buffer pool. */
   const size_t num_frames_;
 

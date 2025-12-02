@@ -1,4 +1,5 @@
 #include "storage/page/page_guard.h"
+#include <iostream>
 #include <memory>
 #include "buffer/arc_replacer.h"
 #include "buffer/buffer_pool_manager.h"
@@ -75,6 +76,8 @@ auto ReadPageGuard::GetPageId() const -> page_id_t {
 
 auto ReadPageGuard::GetData() const -> const char * {
   BUSTUB_ENSURE(is_valid_, "tried to use an invalid read guard");
+  std::cout << "Read page guard: " << page_id_ << " Content "
+            << std::string(frame_->GetData(), std::min(20UL, strlen(frame_->GetData()))) << std::endl;
   return frame_->GetData();
 }
 
@@ -84,10 +87,12 @@ auto ReadPageGuard::IsDirty() const -> bool {
 }
 
 void ReadPageGuard::Flush() {
+  std::scoped_lock bpm_lock(*bpm_latch_);
+
   if (!is_valid_) {
     return;
   }
-  
+
   // Check if the page is dirty (shouldn't be for read guard, but could be from previous write)
   if (!frame_->is_dirty_) {
     return;  // Nothing to flush
@@ -163,6 +168,10 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
   // CRITICAL: Mark as dirty when acquiring write access
   frame_->is_dirty_ = true;
 
+  std::cout << "Write page guard: " << page_id << " Content "
+            << std::string(frame_->GetData(), std::min(20UL, strlen(frame_->GetData()))) << std::endl;
+  std::cout << "Dirty Frame: bool - page_id: " << page_id << " " << frame_->is_dirty_ << std::endl;
+
   is_valid_ = true;
 }
 
@@ -220,6 +229,7 @@ auto WritePageGuard::GetData() const -> const char * {
 
 auto WritePageGuard::GetDataMut() -> char * {
   BUSTUB_ENSURE(is_valid_, "tried to use an invalid write guard");
+  frame_->is_dirty_ = true;
   return frame_->GetDataMut();
 }
 
@@ -235,8 +245,11 @@ void WritePageGuard::Flush() {
 
   // Only flush if dirty
   if (!frame_->is_dirty_) {
+    std::cout << "Write guard completing flushing! " << page_id_ << " (already clean)" << std::endl;
     return;
   }
+
+  std::cout << "Write guard completing flushing! " << page_id_ << std::endl;
 
   // Schedule a write to disk
   auto promise = disk_scheduler_->CreatePromise();
@@ -253,12 +266,15 @@ void WritePageGuard::Flush() {
 
   // Mark as clean after successful flush
   frame_->is_dirty_ = false;
+  std::cout << "Dirty Frame: bool - page_id: " << page_id_ << " " << frame_->is_dirty_ << std::endl;
 }
 
 void WritePageGuard::Drop() {
   if (!is_valid_) {
     return;
   }
+
+  std::cout << "Dirty Frame needed flush: " << page_id_ << " " << frame_->is_dirty_ << std::endl;
 
   is_valid_ = false;
 
@@ -273,6 +289,7 @@ void WritePageGuard::Drop() {
     frame_->pin_count_.fetch_sub(1);
     if (frame_->pin_count_.load() == 0) {
       replacer_->SetEvictable(frame_->frame_id_, true);
+      std::cout << "evictable: " << page_id_ << " 1" << std::endl;
     }
   }
 
